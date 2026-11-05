@@ -3,15 +3,19 @@
 """
 Media Transcriber Suite - Release Publisher GUI
 ================================================
-A small dependency-free desktop tool (tkinter + Python stdlib) to publish a
-GitHub Release and upload one asset (e.g. the built Windows zip).
+A dependency-free desktop tool (tkinter + Python stdlib) that publishes a
+GitHub Release and uploads one or more assets, with a permission self-check,
+proxy support and a cancellable progress display.
 
 Features
 --------
-* Pick a file (zip / exe / anything) via the native file dialog.
-* Set repository (owner/name), tag, release title and body.
-* Enter a Personal Access Token for this session (never save it to disk).
-* Create the release (draft optional) and upload the asset with progress.
+* Pick several files (zip / exe / anything) and upload them in one run.
+* Permission self-check: login, repository access and a real write probe, so a
+  token that cannot upload is reported before anything is published.
+* Proxy mode: follow the system/environment settings, connect directly, or use
+  a custom proxy - useful behind campus or office networks.
+* Create the release, reuse an existing one, optionally keep it as a draft.
+* Streaming upload with speed / remaining time, and a Cancel button.
 
 Run
 ---
@@ -19,20 +23,19 @@ Run
 """
 
 import json
-import os
-import sys
-import threading
-import queue
-import http.client
 import mimetypes
+import os
+import queue
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
 from tkinter import (
-    Tk, ttk, StringVar, BooleanVar, filedialog, messagebox, scrolledtext,
+    Tk, ttk, StringVar, BooleanVar, filedialog, messagebox, scrolledtext, Listbox,
 )
 
 APP_NAME = "Media Transcriber Suite - Release Publisher"
@@ -41,6 +44,10 @@ CONFIG_FILE_NAME = "config.json"
 
 GITHUB_API = "https://api.github.com"
 GITHUB_UPLOADS = "https://uploads.github.com"
+
+
+class UploadCancelled(Exception):
+    """Raised when the user presses Cancel during an upload."""
 
 
 # --------------------------------------------------------------------------
@@ -75,8 +82,20 @@ def save_config(cfg: dict) -> None:
 
 
 # --------------------------------------------------------------------------
-# GitHub API (stdlib only)
+# Network session (proxy aware)
 # --------------------------------------------------------------------------
+
+def build_opener(proxy_mode: str = "system", proxy_url: str = ""):
+    """Return a urllib opener honouring the selected proxy mode."""
+    proxy_mode = (proxy_mode or "system").lower()
+    if proxy_mode == "direct":
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    if proxy_mode == "custom" and proxy_url.strip():
+        addr = proxy_url.strip()
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": addr, "https": addr}))
+    return urllib.request.build_opener()
+
 
 def _headers(token: str, content_type: str | None = None) -> dict:
     h = {
@@ -90,34 +109,88 @@ def _headers(token: str, content_type: str | None = None) -> dict:
     return h
 
 
-def _request(url: str, token: str, *, method: str = "GET",
-             body: dict | None = None, data: bytes | None = None,
-             content_type: str | None = None, timeout: float = 120):
-    payload = data if data is not None else (
-        json.dumps(body).encode("utf-8") if body is not None else None)
-    req = urllib.request.Request(url, data=payload, method=method,
-                                 headers=_headers(token, content_type))
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            return (json.loads(raw) if raw else {}), resp.status
-    except urllib.error.HTTPError as e:
-        err = ""
+def request_json(url: str, token: str, opener, *, method: str = "GET",
+                 body: dict | None = None, timeout: float = 60,
+                 retries: int = 2):
+    """Call the GitHub API and return (json, status, headers).
+
+    Transient network errors are retried; HTTP errors surface immediately with
+    a short, readable message.
+    """
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=payload, method=method,
+                                     headers=_headers(token, "application/json" if payload else None))
         try:
-            err = e.read().decode("utf-8")
-        except Exception:
-            err = str(e)
-        raise RuntimeError(f"HTTP {e.code}: {err[:1000]}") from e
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                headers = {k.lower(): v for k, v in resp.headers.items()}
+                return (json.loads(raw) if raw else {}), resp.status, headers
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8")[:1000]
+            except Exception:
+                detail = str(e)
+            raise RuntimeError(f"HTTP {e.code}: {detail}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"网络错误：{last_error}")
 
 
-def api_user(token: str):
-    obj, _ = _request(f"{GITHUB_API}/user", token)
+def api_user(token: str, opener) -> dict:
+    obj, _, _ = request_json(f"{GITHUB_API}/user", token, opener)
     return obj
 
 
-def find_release_by_tag(owner: str, repo: str, tag: str, token: str) -> dict | None:
+def check_permissions(owner: str, repo: str, token: str, opener) -> dict:
+    """Diagnose exactly what a token can and cannot do on one repository."""
+    info = {
+        "login": None, "scopes": None, "repo_ok": False, "user_perms": {},
+        "default_branch": None, "can_write": False,
+        "repo_error": None, "write_error": None, "notes": [],
+    }
+    user, _, headers = request_json(f"{GITHUB_API}/user", token, opener)
+    info["login"] = user.get("login")
+    # Classic tokens advertise their scopes here; fine-grained tokens do not.
+    info["scopes"] = headers.get("x-oauth-scopes", "").strip() or None
+
     try:
-        obj, _ = _request(f"{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}", token)
+        repo_obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}", token, opener)
+    except RuntimeError as e:
+        info["repo_error"] = str(e)
+        return info
+    info["repo_ok"] = True
+    info["default_branch"] = repo_obj.get("default_branch")
+    info["user_perms"] = repo_obj.get("permissions") or {}
+
+    try:
+        # Creating an unreferenced blob proves Contents: write without leaving
+        # any visible change in the repository.
+        request_json(f"{GITHUB_API}/repos/{owner}/{repo}/git/blobs", token, opener,
+                     method="POST", body={"content": "release-publisher probe",
+                                          "encoding": "utf-8"})
+        info["can_write"] = True
+    except RuntimeError as e:
+        info["write_error"] = str(e)
+
+    scopes = info["scopes"]
+    if scopes is not None:
+        granted = {s.strip() for s in scopes.split(",") if s.strip()}
+        if "repo" not in granted:
+            info["notes"].append("Classic token 缺少 repo scope，无法创建 Release。")
+        if "workflow" not in granted:
+            info["notes"].append("Classic token 缺少 workflow scope：可以发 Release，但无法推送 .github/workflows/ 文件。")
+    return info
+
+
+def find_release_by_tag(owner: str, repo: str, tag: str, token: str, opener) -> dict | None:
+    try:
+        obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}",
+                                 token, opener)
         return obj
     except RuntimeError as e:
         if str(e).startswith("HTTP 404:"):
@@ -125,7 +198,7 @@ def find_release_by_tag(owner: str, repo: str, tag: str, token: str) -> dict | N
         raise
 
 
-def create_release(owner: str, repo: str, token: str, *, tag: str, name: str,
+def create_release(owner: str, repo: str, token: str, opener, *, tag: str, name: str,
                    body: str, draft: bool) -> dict:
     payload = {
         "tag_name": tag,
@@ -135,58 +208,128 @@ def create_release(owner: str, repo: str, token: str, *, tag: str, name: str,
         "prerelease": False,
         "generate_release_notes": False,
     }
-    obj, _ = _request(f"{GITHUB_API}/repos/{owner}/{repo}/releases", token,
-                      method="POST", body=payload)
+    obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}/releases", token, opener,
+                             method="POST", body=payload)
     return obj
 
 
-def upload_asset(owner: str, repo: str, release_id: int, token: str,
-                 file_path: str, progress_cb=None) -> dict:
+def update_release(owner: str, repo: str, token: str, opener, release_id: int, *,
+                   name: str, body: str, draft: bool) -> dict:
+    payload = {"name": name or None, "body": body, "draft": draft}
+    obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}/releases/{release_id}",
+                             token, opener, method="PATCH", body=payload)
+    return obj
+
+
+MIME_OVERRIDES = {
+    ".zip": "application/zip",
+    ".exe": "application/vnd.microsoft.portable-executable",
+    ".msi": "application/x-msi",
+    ".7z": "application/x-7z-compressed",
+    ".tar.gz": "application/gzip",
+    ".tgz": "application/gzip",
+}
+
+
+def guess_content_type(name: str) -> str:
+    """Stable MIME type (the Windows registry maps .zip inconsistently)."""
+    lowered = name.lower()
+    for suffix, mime in MIME_OVERRIDES.items():
+        if lowered.endswith(suffix):
+            return mime
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+class _ProgressBody:
+    """File wrapper that reports progress and allows cancellation mid-upload."""
+
+    def __init__(self, path: str, total: int, progress_cb=None, cancel: threading.Event | None = None):
+        self._fh = open(path, "rb")
+        self._total = total
+        self._sent = 0
+        self._cb = progress_cb
+        self._cancel = cancel
+
+    def read(self, size: int = -1) -> bytes:
+        if self._cancel is not None and self._cancel.is_set():
+            raise UploadCancelled()
+        chunk = self._fh.read(1024 * 1024 if size is None or size < 0 else max(size, 1024 * 1024))
+        self._sent += len(chunk)
+        if self._cb and self._total:
+            self._cb(min(0.999, self._sent / self._total), self._sent)
+        return chunk
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+def upload_asset(owner: str, repo: str, release_id: int, token: str, file_path: str,
+                 opener, progress_cb=None, cancel: threading.Event | None = None) -> dict:
     """Stream a release asset without loading the whole file into memory."""
     asset_name = os.path.basename(file_path)
     total = os.path.getsize(file_path)
     encoded = urllib.parse.quote(asset_name, safe="")
-    content_type = mimetypes.guess_type(asset_name)[0] or "application/octet-stream"
-    path = f"/repos/{owner}/{repo}/releases/{release_id}/assets?name={encoded}"
-    conn = http.client.HTTPSConnection("uploads.github.com", timeout=1800)
+    content_type = guess_content_type(asset_name)
+    url = f"{GITHUB_UPLOADS}/repos/{owner}/{repo}/releases/{release_id}/assets?name={encoded}"
+
+    headers = _headers(token, content_type)
+    headers["Content-Length"] = str(total)
+    body = _ProgressBody(file_path, total, progress_cb, cancel)
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
-        conn.putrequest("POST", path)
-        for key, value in _headers(token, content_type).items():
-            conn.putheader(key, value)
-        conn.putheader("Content-Length", str(total))
-        conn.endheaders()
-        sent = 0
-        with open(file_path, "rb") as fh:
-            while chunk := fh.read(1024 * 1024):
-                conn.send(chunk)
-                sent += len(chunk)
-                if progress_cb and total:
-                    progress_cb(min(0.99, sent / total))
-        resp = conn.getresponse()
-        raw = resp.read().decode("utf-8")
-        if not 200 <= resp.status < 300:
-            raise RuntimeError(f"上传失败 HTTP {resp.status}: {raw[:1000]}")
+        with opener.open(req, timeout=1800) as resp:
+            raw = resp.read().decode("utf-8")
+            if not 200 <= resp.status < 300:
+                raise RuntimeError(f"上传失败 HTTP {resp.status}: {raw[:1000]}")
         if progress_cb:
-            progress_cb(1.0)
+            progress_cb(1.0, total)
         return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")[:1000]
+        except Exception:
+            detail = str(e)
+        raise RuntimeError(f"上传失败 HTTP {e.code}: {detail}") from e
     finally:
-        conn.close()
+        body.close()
 
 
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
 
+PROXY_LABELS = {
+    "跟随系统 / 环境变量": "system",
+    "强制直连（不走代理）": "direct",
+    "使用自定义代理": "custom",
+}
+
+
+def human_size(num: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(num) < 1024 or unit == "GB":
+            return f"{num:.1f} {unit}" if unit != "B" else f"{int(num)} B"
+        num /= 1024
+    return f"{num:.1f} GB"
+
+
 class ReleasePublisherApp:
     def __init__(self, root: Tk):
         self.root = root
         root.title(APP_NAME)
-        root.geometry("780x780")
-        root.minsize(640, 560)
+        root.geometry("880x840")
+        root.minsize(720, 620)
 
         self.cfg = load_config()
         self._busy = False
         self._events = queue.Queue()
+        self._cancel = threading.Event()
+        self._files: list[str] = []
+        self._release_url = ""
 
         self._build_ui()
         self._populate_from_config()
@@ -196,35 +339,51 @@ class ReleasePublisherApp:
     def _build_ui(self):
         pad = {"padx": 12, "pady": 6}
 
-        # --- ① auth ---
-        auth = ttk.LabelFrame(self.root, text="① GitHub 连接", padding=10)
+        # --- ① auth & network ---
+        auth = ttk.LabelFrame(self.root, text="① GitHub 连接与网络", padding=10)
         auth.pack(fill="x", **pad)
+        auth.columnconfigure(1, weight=1)
+
         ttk.Label(auth, text="Token（个人访问令牌）:").grid(row=0, column=0, sticky="w")
         self.token_var = StringVar()
         self.token_entry = ttk.Entry(auth, textvariable=self.token_var, show="●", width=52)
         self.token_entry.grid(row=0, column=1, sticky="we", padx=8)
-        auth.columnconfigure(1, weight=1)
-
         self.show_token = BooleanVar(value=False)
         ttk.Checkbutton(auth, text="显示", variable=self.show_token,
                         command=self._toggle_token_visibility).grid(row=0, column=2)
 
-        self.verify_btn = ttk.Button(auth, text="验证 Token", command=self._verify_token)
-        self.verify_btn.grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(auth, text="网络:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        net_row = ttk.Frame(auth)
+        net_row.grid(row=1, column=1, columnspan=2, sticky="we", padx=8, pady=(6, 0))
+        self.proxy_mode = StringVar(value="跟随系统 / 环境变量")
+        self.proxy_combo = ttk.Combobox(net_row, textvariable=self.proxy_mode, width=20,
+                                        state="readonly", values=list(PROXY_LABELS))
+        self.proxy_combo.pack(side="left")
+        self.proxy_var = StringVar()
+        self.proxy_entry = ttk.Entry(net_row, textvariable=self.proxy_var, width=32)
+        self.proxy_entry.pack(side="left", padx=8, fill="x", expand=True)
+        self.proxy_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_proxy_state())
+
+        btn_row = ttk.Frame(auth)
+        btn_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=8, pady=(8, 0))
+        self.verify_btn = ttk.Button(btn_row, text="权限自检", command=self._check_permissions)
+        self.verify_btn.pack(side="left")
+        ttk.Label(btn_row, text="（检查登录、仓库访问与写入权限）",
+                  foreground="#888").pack(side="left", padx=8)
 
         self.auth_hint = StringVar(
             value="Token 仅在本次运行时保留在内存中，不写入配置文件。")
         ttk.Label(auth, textvariable=self.auth_hint, foreground="#666").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         # --- ② repo & release ---
         info = ttk.LabelFrame(self.root, text="② 仓库与 Release", padding=10)
         info.pack(fill="x", **pad)
+        info.columnconfigure(1, weight=1)
 
         ttk.Label(info, text="仓库（owner/name）:").grid(row=0, column=0, sticky="w")
         self.repo_var = StringVar()
         ttk.Entry(info, textvariable=self.repo_var, width=44).grid(row=0, column=1, sticky="we", padx=8)
-        info.columnconfigure(1, weight=1)
 
         ttk.Label(info, text="Tag（如 v1.2.0）:").grid(row=1, column=0, sticky="w")
         self.tag_var = StringVar()
@@ -235,39 +394,61 @@ class ReleasePublisherApp:
         ttk.Entry(info, textvariable=self.title_var, width=44).grid(row=2, column=1, sticky="we", padx=8)
 
         ttk.Label(info, text="发布说明（支持 Markdown）:").grid(row=3, column=0, sticky="nw")
-        self.body_text = scrolledtext.ScrolledText(info, width=52, height=8, wrap="word")
+        self.body_text = scrolledtext.ScrolledText(info, width=52, height=6, wrap="word")
         self.body_text.grid(row=3, column=1, sticky="we", padx=8, pady=4)
 
-        ttk.Label(info, text="文件（zip / exe 等）:").grid(row=4, column=0, sticky="w")
-        self.file_var = StringVar()
-        self.file_entry = ttk.Entry(info, textvariable=self.file_var, width=44)
-        self.file_entry.grid(row=4, column=1, sticky="we", padx=8)
-        ttk.Button(info, text="浏览…", command=self._browse_file).grid(row=4, column=2)
-
-        # --- ③ options ---
-        opts = ttk.LabelFrame(self.root, text="③ 发布选项", padding=10)
-        opts.pack(fill="x", **pad)
+        opts_row = ttk.Frame(info)
+        opts_row.grid(row=4, column=1, sticky="w", padx=8)
         self.draft_var = BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="保存为草稿（Draft），之后在网页上手动发布",
-                        variable=self.draft_var).pack(anchor="w")
+        ttk.Checkbutton(opts_row, text="保存为草稿，稍后手动发布",
+                        variable=self.draft_var).pack(side="left")
+        self.update_body_var = BooleanVar(value=True)
+        ttk.Checkbutton(opts_row, text="更新的 Release 说明",
+                        variable=self.update_body_var).pack(side="left", padx=16)
+
+        # --- ③ files ---
+        files = ttk.LabelFrame(self.root, text="③ 要上传的文件", padding=10)
+        files.pack(fill="both", expand=True, **pad)
+        files.columnconfigure(0, weight=1)
+
+        self.file_list = Listbox(files, height=5, selectmode="extended", activestyle="dotbox")
+        self.file_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        scroll = ttk.Scrollbar(files, orient="vertical", command=self.file_list.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.file_list.configure(yscrollcommand=scroll.set)
+
+        file_btns = ttk.Frame(files)
+        file_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(file_btns, text="添加文件…", command=self._add_files).pack(side="left")
+        ttk.Button(file_btns, text="移除所选", command=self._remove_selected).pack(side="left", padx=8)
+        ttk.Button(file_btns, text="清空", command=self._clear_files).pack(side="left")
+        self.file_hint = StringVar(value="尚未选择文件")
+        ttk.Label(file_btns, textvariable=self.file_hint, foreground="#888").pack(side="left", padx=12)
 
         # --- ④ actions ---
-        actions = ttk.LabelFrame(self.root, text="④ 操作", padding=10)
+        actions = ttk.LabelFrame(self.root, text="④ 发布", padding=10)
         actions.pack(fill="x", **pad)
-        btn_row = ttk.Frame(actions)
-        btn_row.pack(fill="x")
-        self.publish_btn = ttk.Button(btn_row, text="创建 Release 并上传文件", command=self._publish)
+        btn_row2 = ttk.Frame(actions)
+        btn_row2.pack(fill="x")
+        self.publish_btn = ttk.Button(btn_row2, text="创建 Release 并上传", command=self._publish)
         self.publish_btn.pack(side="left")
-        self.status_label = ttk.Label(actions, text="就绪")
-        self.status_label.pack(side="left", padx=16)
+        self.cancel_btn = ttk.Button(btn_row2, text="取消", command=self._cancel_upload, state="disabled")
+        self.cancel_btn.pack(side="left", padx=8)
+        self.open_btn = ttk.Button(btn_row2, text="打开 Release 页面",
+                                   command=self._open_release, state="disabled")
+        self.open_btn.pack(side="left", padx=8)
+        self.status_label = ttk.Label(btn_row2, text="就绪")
+        self.status_label.pack(side="left", padx=12)
 
         self.progress = ttk.Progressbar(actions, mode="determinate", maximum=100)
-        self.progress.pack(fill="x", pady=(8, 4))
+        self.progress.pack(fill="x", pady=(8, 2))
+        self.progress_hint = StringVar(value="")
+        ttk.Label(actions, textvariable=self.progress_hint, foreground="#666").pack(anchor="w")
 
-        # --- log ---
+        # --- ⑤ log ---
         log_frame = ttk.LabelFrame(self.root, text="日志", padding=10)
         log_frame.pack(fill="both", expand=True, **pad)
-        self.log = scrolledtext.ScrolledText(log_frame, height=8, state="disabled", wrap="word")
+        self.log = scrolledtext.ScrolledText(log_frame, height=7, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True)
 
     def _populate_from_config(self):
@@ -276,17 +457,35 @@ class ReleasePublisherApp:
         self.tag_var.set(self.cfg.get("tag", ""))
         self.title_var.set(self.cfg.get("title", ""))
         self.body_text.insert("1.0", self.cfg.get("body", ""))
-        self.file_var.set(self.cfg.get("last_file", ""))
+        mode = self.cfg.get("proxy_mode", "system")
+        for label, value in PROXY_LABELS.items():
+            if value == mode:
+                self.proxy_mode.set(label)
+                break
+        self.proxy_var.set(self.cfg.get("proxy_url", ""))
+        self._sync_proxy_state()
+        for path in self.cfg.get("files", []) or []:
+            if os.path.isfile(path):
+                self._files.append(path)
+        self._refresh_file_list()
 
-    # ---- minor helpers ----
+    # ---- helpers ----
     def _toggle_token_visibility(self):
         self.token_entry.config(show="" if self.show_token.get() else "●")
+
+    def _sync_proxy_state(self):
+        custom = PROXY_LABELS.get(self.proxy_mode.get()) == "custom"
+        self.proxy_entry.config(state="normal" if custom else "disabled")
+
+    def _current_proxy(self) -> tuple[str, str]:
+        return PROXY_LABELS.get(self.proxy_mode.get(), "system"), self.proxy_var.get().strip()
 
     def _set_busy(self, busy: bool):
         self._busy = busy
         state = "disabled" if busy else "normal"
         self.publish_btn.config(state=state)
         self.verify_btn.config(state=state)
+        self.cancel_btn.config(state="normal" if busy else "disabled")
 
     def _log(self, msg: str):
         self._events.put(("log", msg))
@@ -304,18 +503,47 @@ class ReleasePublisherApp:
                 self.log.config(state="disabled")
             elif kind == "progress":
                 self.progress.config(value=value)
+            elif kind == "hint":
+                self.progress_hint.set(value)
             elif kind == "finish":
                 ok, result, cb = value
                 self._finish_async(ok, result, cb)
         self.root.after(100, self._drain_events)
 
-    # ---- actions ----
-    def _browse_file(self):
-        path = filedialog.askopenfilename(title="选择要上传的文件（如打包好的 zip）")
-        if path:
-            self.file_var.set(path)
+    # ---- files ----
+    def _add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="选择要上传的文件（可多选）",
+            filetypes=[("压缩包", "*.zip"), ("可执行文件", "*.exe"), ("所有文件", "*.*")])
+        for path in paths:
+            if path not in self._files:
+                self._files.append(path)
+        self._refresh_file_list()
 
-    def _validate(self):
+    def _remove_selected(self):
+        for index in sorted(self.file_list.curselection(), reverse=True):
+            del self._files[index]
+        self._refresh_file_list()
+
+    def _clear_files(self):
+        self._files.clear()
+        self._refresh_file_list()
+
+    def _refresh_file_list(self):
+        self.file_list.delete(0, "end")
+        total = 0
+        for path in self._files:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            total += size
+            self.file_list.insert("end", f"{os.path.basename(path)}  ({human_size(size)})")
+        self.file_hint.set(
+            f"{len(self._files)} 个文件，共 {human_size(total)}" if self._files else "尚未选择文件")
+
+    # ---- validation ----
+    def _validate_common(self):
         token = self.token_var.get().strip()
         if not token:
             raise ValueError("请先填写 GitHub Token（可在 github.com/settings/tokens 创建）")
@@ -325,80 +553,171 @@ class ReleasePublisherApp:
         tag = self.tag_var.get().strip()
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
             raise ValueError("Tag 仅可包含英文字母、数字、点、横线和下划线，如 v1.2.0")
-        path = self.file_var.get().strip()
-        if not path:
-            raise ValueError("请选择要上传的文件")
-        if not os.path.isfile(path):
-            raise ValueError(f"文件不存在：{path}")
-        return token, repo, tag, self.title_var.get(), self.body_text.get("1.0", "end").strip(), path
+        proxy_mode, proxy_url = self._current_proxy()
+        if proxy_mode == "custom" and not proxy_url:
+            raise ValueError("选择了自定义代理，但代理地址为空（例如 http://127.0.0.1:7890）")
+        return token, repo, tag, proxy_mode, proxy_url
 
-    def _verify_token(self):
-        token = self.token_var.get().strip()
-        if not token:
-            messagebox.showwarning("提示", "请先填写 Token")
+    def _validate_publish(self):
+        token, repo, tag, proxy_mode, proxy_url = self._validate_common()
+        if not self._files:
+            raise ValueError("请至少添加一个要上传的文件")
+        missing = [p for p in self._files if not os.path.isfile(p)]
+        if missing:
+            raise ValueError("以下文件不存在：" + "、".join(missing))
+        body = self.body_text.get("1.0", "end").strip()
+        return (token, repo, tag, self.title_var.get().strip(), body,
+                list(self._files), proxy_mode, proxy_url)
+
+    # ---- actions ----
+    def _check_permissions(self):
+        if self._busy:
             return
-        self._run_async(
-            lambda: api_user(token),
-            on_success=lambda u: self._log(f"Token 有效：登录名 {u.get('login')}"),
-            on_error=lambda e: self._log(f"校验失败：{e}"),
-            status="正在校验 Token…",
-        )
+        try:
+            token, repo, _, proxy_mode, proxy_url = self._validate_common()
+        except ValueError as e:
+            messagebox.showwarning("输入有误", str(e))
+            return
+        owner, name = repo.split("/", 1)
+        opener = build_opener(proxy_mode, proxy_url)
+
+        def job():
+            info = check_permissions(owner, name, token, opener)
+            self._log(f"登录账号：{info['login']}")
+            if info["repo_error"]:
+                self._log(f"仓库访问失败：{info['repo_error']}")
+                raise RuntimeError("无法访问该仓库，请检查仓库名和 Token 的仓库范围")
+            self._log(f"仓库可访问，默认分支 {info['default_branch']}")
+            if info["scopes"] is not None:
+                self._log(f"Token 类型：classic，scopes={info['scopes'] or '（空）'}")
+            else:
+                self._log("Token 类型：fine-grained（细粒度）")
+            if info["can_write"]:
+                self._log("写入检查：通过，可以创建 Release 并上传附件")
+            else:
+                self._log(f"写入检查：失败 — {info['write_error']}")
+            for note in info["notes"]:
+                self._log(f"提示：{note}")
+            return info
+
+        self._run_async(job, on_success=self._permissions_done,
+                        on_error=lambda e: self._log(f"自检失败：{e}"),
+                        status="正在自检…")
+
+    def _permissions_done(self, info):
+        if not info["can_write"]:
+            hint = ""
+            if info["scopes"] is None:
+                hint = ("\n\n这是细粒度 Token：请到 Token 设置里把 Repository access 选为\n"
+                        "Only select repositories（勾选本仓库），并把\n"
+                        "Permissions → Repository permissions → Contents 设为 Read and write。")
+            else:
+                hint = "\n\n这是 classic Token：请勾选 repo scope 后重新生成。"
+            messagebox.showerror("没有写权限",
+                                 f"该 Token 无法在此仓库创建 Release。{(info['write_error'] or '')[:300]}{hint}")
+        else:
+            extra = ""
+            if info["notes"]:
+                extra = "\n\n" + "\n".join(info["notes"])
+            messagebox.showinfo("自检通过", f"账号 {info['login']} 可以发布到此仓库。{extra}")
 
     def _publish(self):
         if self._busy:
             return
         try:
-            token, repo, tag, title, body, path = self._validate()
+            (token, repo, tag, title, body, files,
+             proxy_mode, proxy_url) = self._validate_publish()
         except ValueError as e:
             messagebox.showwarning("输入有误", str(e))
             return
-        owner, repo_name = repo.split("/", 1)
+
+        owner, name = repo.split("/", 1)
         draft = self.draft_var.get()
+        update_body = self.update_body_var.get()
+        opener = build_opener(proxy_mode, proxy_url)
+        self._cancel.clear()
+        self._release_url = ""
 
         save_config({
-            "repo": repo, "tag": tag,
-            "title": title, "body": body, "last_file": path,
+            "repo": repo, "tag": tag, "title": title, "body": body,
+            "files": files, "proxy_mode": proxy_mode, "proxy_url": proxy_url,
         })
 
         def job():
-            existing = find_release_by_tag(owner, repo_name, tag, token)
+            existing = find_release_by_tag(owner, name, tag, token, opener)
             if existing:
                 release_id = existing["id"]
                 self._log(f"已存在 Release（id={release_id}），直接上传附件。")
+                if update_body:
+                    update_release(owner, name, token, opener, release_id,
+                                   name=title or tag, body=body, draft=draft)
+                    self._log("已更新 Release 标题/说明。")
             else:
                 self._log(f"创建 Release：{tag} @ {repo}")
-                rel = create_release(owner, repo_name, token, tag=tag,
-                                     name=title or tag, body=body,
-                                     draft=draft)
+                rel = create_release(owner, name, token, opener, tag=tag,
+                                     name=title or tag, body=body, draft=draft)
                 release_id = rel["id"]
                 self._log(f"已创建 Release id={release_id}（draft={draft}）")
 
-            self._log(f"正在上传 {os.path.basename(path)}（{round(os.path.getsize(path)/1e6,1)} MB）…")
-            asset = upload_asset(owner, repo_name, release_id, token, path,
-                                 progress_cb=self._on_progress)
-            self._log(f"上传完成：{asset.get('name')}（{asset.get('size')} bytes）")
+            total = len(files)
+            for index, path in enumerate(files, start=1):
+                if self._cancel.is_set():
+                    raise UploadCancelled()
+                size = os.path.getsize(path)
+                self._log(f"[{index}/{total}] 上传 {os.path.basename(path)}（{human_size(size)}）…")
+                asset = upload_asset(owner, name, release_id, token, path, opener,
+                                     progress_cb=self._make_progress(index, total, size),
+                                     cancel=self._cancel)
+                self._log(f"[{index}/{total}] 完成：{asset.get('name')}（{asset.get('size')} bytes）")
+
             url = f"https://github.com/{repo}/releases/tag/{tag}"
             self._log(f"Release 地址：{url}")
             return url
 
         self.progress["value"] = 0
-        self._run_async(job,
-                        on_success=self._publish_done,
-                        on_error=lambda e: self._log(f"发布失败：{e}"),
-                        status="正在发布…")
+        self.progress_hint.set("")
+        self._run_async(job, on_success=self._publish_done,
+                        on_error=self._publish_failed, status="正在发布…")
+
+    def _make_progress(self, index: int, total: int, size: int):
+        start = time.time()
+
+        def cb(frac: float, sent: int):
+            overall = ((index - 1) + frac) / max(total, 1) * 100
+            elapsed = max(time.time() - start, 1e-6)
+            speed = sent / elapsed
+            remaining = (size - sent) / speed if speed > 0 else 0
+            self._events.put(("progress", int(overall)))
+            self._events.put(("hint",
+                              f"[{index}/{total}] {frac*100:5.1f}%  "
+                              f"{human_size(sent)} / {human_size(size)}  "
+                              f"{human_size(speed)}/s  剩余 {int(remaining)}s"))
+
+        return cb
 
     def _publish_done(self, url):
+        self._release_url = url
         self.progress["value"] = 100
+        self.open_btn.config(state="normal")
         messagebox.showinfo("完成", f"已发布：\n{url}")
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
 
-    def _on_progress(self, frac: float):
-        pct = int(frac * 100)
-        self._events.put(("progress", pct))
+    def _publish_failed(self, err):
+        if isinstance(err, UploadCancelled):
+            self._log("已取消上传。已上传的部分附件会留在 Release 上，可稍后重试或手动删除。")
+            self.status_label.config(text="已取消")
+            return
+        self._log(f"发布失败：{err}")
+        messagebox.showerror("发布失败", str(err)[:800])
 
+    def _cancel_upload(self):
+        self._cancel.set()
+        self._log("正在取消…（当前分块传完后停止）")
+
+    def _open_release(self):
+        if self._release_url:
+            webbrowser.open(self._release_url)
+
+    # ---- threading ----
     def _run_async(self, fn, on_success, on_error, status=""):
         self._set_busy(True)
         self.status_label.config(text=status or "工作中…")
@@ -409,7 +728,7 @@ class ReleasePublisherApp:
                 result = fn()
                 self._events.put(("finish", (True, result, on_success)))
             except Exception as e:  # noqa: BLE001
-                self._events.put(("finish", (False, str(e), on_error)))
+                self._events.put(("finish", (False, e, on_error)))
 
         threading.Thread(target=target, daemon=True).start()
 
@@ -425,7 +744,9 @@ class ReleasePublisherApp:
                 "tag": self.tag_var.get().strip(),
                 "title": self.title_var.get(),
                 "body": self.body_text.get("1.0", "end").strip(),
-                "last_file": self.file_var.get().strip(),
+                "files": list(self._files),
+                "proxy_mode": self._current_proxy()[0],
+                "proxy_url": self._current_proxy()[1],
             })
         except Exception:
             pass

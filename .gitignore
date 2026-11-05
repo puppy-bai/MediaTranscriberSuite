@@ -13,6 +13,11 @@ MediaTranscriberSuite/data/
 # Packaged Windows build (distributed as a GitHub Release asset, not in git)
 MediaTranscriberSuite/
 
+# Release publisher tool build output
+release_tool/build/
+release_tool/dist/
+release_tool/*.spec
+
 # OS / editor noise
 Thumbs.db
 .DS_Store
