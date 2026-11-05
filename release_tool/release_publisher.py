@@ -257,20 +257,30 @@ def _encode_branch(branch: str) -> str:
 
 def get_branch_head(owner: str, repo: str, branch: str, token: str, opener):
     """Return (commit_sha, tree_sha) or (None, None) when the branch is absent."""
+    ref_url = f"{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/{_encode_branch(branch)}"
     try:
-        ref, _, _ = request_json(
-            f"{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/{_encode_branch(branch)}",
-            token, opener)
+        ref, _, _ = request_json(ref_url, token, opener)
     except RuntimeError as e:
-        if str(e).startswith("HTTP 404:") or str(e).startswith("HTTP 409:"):
+        if str(e).startswith("HTTP 404:"):
+            # A 404 can also mean an inaccessible repository/token. Verify the
+            # repository before treating it as an absent branch.
+            try:
+                request_json(f"{GITHUB_API}/repos/{owner}/{repo}", token, opener)
+            except RuntimeError as repo_error:
+                raise RuntimeError(
+                    f"无法访问仓库 {owner}/{repo}；请检查仓库名称、Token 授权范围和网络："
+                    f"{repo_error}") from repo_error
             return None, None
-        raise
+        raise RuntimeError(f"读取分支 {branch} 失败（{ref_url}）：{e}") from e
     commit_sha = (ref.get("object") or {}).get("sha")
     if not commit_sha:
-        return None, None
+        raise RuntimeError(f"分支 {branch} 的引用没有提交 SHA，无法安全上传。")
     commit, _, _ = request_json(
         f"{GITHUB_API}/repos/{owner}/{repo}/git/commits/{commit_sha}", token, opener)
-    return commit_sha, (commit.get("tree") or {}).get("sha")
+    tree_sha = (commit.get("tree") or {}).get("sha")
+    if not tree_sha:
+        raise RuntimeError(f"无法读取分支 {branch} 的基础目录树，已停止以免覆盖仓库内容。")
+    return commit_sha, tree_sha
 
 
 def create_blob(owner: str, repo: str, token: str, opener, data: bytes) -> str:
@@ -299,19 +309,18 @@ def create_commit(owner: str, repo: str, token: str, opener, message: str,
     return obj
 
 
-def update_branch_ref(owner: str, repo: str, token: str, opener, branch: str, sha: str) -> dict:
-    try:
-        obj, _, _ = request_json(
-            f"{GITHUB_API}/repos/{owner}/{repo}/git/refs/heads/{_encode_branch(branch)}",
-            token, opener, method="PATCH", body={"sha": sha, "force": False})
-        return obj
-    except RuntimeError as e:
-        if not str(e).startswith("HTTP 404:"):
-            raise
+def update_branch_ref(owner: str, repo: str, token: str, opener, branch: str,
+                      sha: str, *, create: bool = False) -> dict:
+    """Move an existing branch, or create only when absence was confirmed earlier."""
+    if create:
         obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}/git/refs", token, opener,
                                  method="POST",
                                  body={"ref": f"refs/heads/{branch}", "sha": sha})
-        return obj
+    else:
+        obj, _, _ = request_json(
+            f"{GITHUB_API}/repos/{owner}/{repo}/git/refs/heads/{_encode_branch(branch)}",
+            token, opener, method="PATCH", body={"sha": sha, "force": False})
+    return obj
 
 
 def upload_files_to_repo(owner: str, repo: str, token: str, opener,
@@ -326,6 +335,14 @@ def upload_files_to_repo(owner: str, repo: str, token: str, opener,
     """
     prefix = target_dir.strip().strip("/")
     total = len(files)
+    if not total:
+        raise ValueError("请先选择至少一个要上传的文件。")
+    if log:
+        log(f"检查仓库 {owner}/{repo} 的分支 {branch}…")
+    commit_sha, tree_sha = get_branch_head(owner, repo, branch, token, opener)
+    if log:
+        log(f"目标分支 {branch}：" + (f"基于提交 {commit_sha[:10]}" if commit_sha else "尚不存在，将新建"))
+    blobs: list[tuple[str, str]] = []
     for index, (local_path, rel) in enumerate(files, start=1):
         if cancel is not None and cancel.is_set():
             raise UploadCancelled()
@@ -338,16 +355,12 @@ def upload_files_to_repo(owner: str, repo: str, token: str, opener,
         with open(local_path, "rb") as fh:
             data = fh.read()
         blob_sha = create_blob(owner, repo, token, opener, data)
-        files[index - 1] = (local_path, rel, blob_sha, size)
+        blobs.append((rel, blob_sha))
         if progress_cb:
             progress_cb(index / max(total + 2, 1), rel)
 
-    commit_sha, tree_sha = get_branch_head(owner, repo, branch, token, opener)
-    if log:
-        log(f"目标分支 {branch}：" + (f"基于提交 {commit_sha[:10]}" if commit_sha else "尚不存在，将新建"))
-
     entries = []
-    for _, rel, blob_sha, _size in files:  # type: ignore[misc]
+    for rel, blob_sha in blobs:
         path = f"{prefix}/{rel}" if prefix else rel
         entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
 
@@ -358,7 +371,8 @@ def upload_files_to_repo(owner: str, repo: str, token: str, opener,
     commit = create_commit(owner, repo, token, opener,
                            message or f"Upload {total} file(s) to {prefix or 'repository root'}",
                            new_tree, [commit_sha] if commit_sha else [])
-    update_branch_ref(owner, repo, token, opener, branch, commit["sha"])
+    update_branch_ref(owner, repo, token, opener, branch, commit["sha"],
+                      create=commit_sha is None)
     if progress_cb:
         progress_cb(1.0, "ref")
     return {
@@ -877,11 +891,13 @@ class ReleasePublisherApp:
         if not self._repo_files:
             messagebox.showwarning("没有文件", "请先在“④ 上传文件/文件夹”里添加文件或文件夹。")
             return
+        if self._busy:
+            return
         branch = self.branch_var.get().strip()
         if not branch or not re.fullmatch(r"[A-Za-z0-9._/-]{1,250}", branch):
             messagebox.showwarning("分支无效", "分支名不能为空，且只能包含字母、数字、点、下划线、斜杠。")
             return
-        owner, _name = repo.split("/", 1)
+        owner, name = repo.split("/", 1)
         target_dir = self.repo_dir_var.get().strip()
         message = self.commit_msg_var.get().strip() or None
         opener = build_opener(proxy_mode, proxy_url)
@@ -896,7 +912,7 @@ class ReleasePublisherApp:
         def worker():
             try:
                 result = upload_files_to_repo(
-                    owner, repo, token, opener, files,
+                    owner, name, token, opener, files,
                     branch=branch, target_dir=target_dir, message=message,
                     progress_cb=lambda frac, label: self._set_progress(frac * 90, label),
                     cancel=self._cancel_evt, log=self._log)
