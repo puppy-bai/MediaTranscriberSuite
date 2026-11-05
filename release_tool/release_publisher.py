@@ -35,12 +35,18 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 from tkinter import (
-    Tk, ttk, StringVar, BooleanVar, filedialog, messagebox, scrolledtext, Listbox,
+    Tk, Toplevel, ttk, StringVar, BooleanVar, filedialog, messagebox, scrolledtext, Listbox,
 )
+
+try:
+    from . import token_store
+except ImportError:  # Direct script launch and PyInstaller onefile.
+    import token_store
 
 APP_NAME = "Media Transcriber Suite - Release Publisher"
 CONFIG_DIR_NAME = ".media_transcriber_release_tool"
 CONFIG_FILE_NAME = "config.json"
+DEFAULT_REPO = "puppy-bai/MediaTranscriberSuite"
 
 GITHUB_API = "https://api.github.com"
 GITHUB_UPLOADS = "https://uploads.github.com"
@@ -221,6 +227,22 @@ def update_release(owner: str, repo: str, token: str, opener, release_id: int, *
     return obj
 
 
+def create_repository(token: str, opener, *, name: str, description: str = "",
+                      private: bool = False, auto_init: bool = True) -> dict:
+    """Create a repository owned by the authenticated user (POST /user/repos)."""
+    payload = {
+        "name": name,
+        "description": description,
+        "private": private,
+        "auto_init": auto_init,
+        "has_issues": True,
+        "has_wiki": False,
+    }
+    obj, _, _ = request_json(f"{GITHUB_API}/user/repos", token, opener,
+                             method="POST", body=payload)
+    return obj
+
+
 MIME_OVERRIDES = {
     ".zip": "application/zip",
     ".exe": "application/vnd.microsoft.portable-executable",
@@ -330,10 +352,15 @@ class ReleasePublisherApp:
         self._cancel = threading.Event()
         self._files: list[str] = []
         self._release_url = ""
+        self._saved_token_error = None
+        self._create_win = None
 
         self._build_ui()
         self._populate_from_config()
         self.root.after(100, self._drain_events)
+        if self._saved_token_error:
+            self.root.after(200, lambda: messagebox.showwarning(
+                "已保存的 Token 无法读取", self._saved_token_error))
 
     # ---- UI ----
     def _build_ui(self):
@@ -352,9 +379,15 @@ class ReleasePublisherApp:
         ttk.Checkbutton(auth, text="显示", variable=self.show_token,
                         command=self._toggle_token_visibility).grid(row=0, column=2)
 
-        ttk.Label(auth, text="网络:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.remember_token = BooleanVar(value=False)
+        self.remember_checkbox = ttk.Checkbutton(
+            auth, text="记住 Token（仅当前 Windows 用户可解密）",
+            variable=self.remember_token, command=self._remember_token_changed)
+        self.remember_checkbox.grid(row=1, column=1, columnspan=2, sticky="w", padx=8, pady=(5, 0))
+
+        ttk.Label(auth, text="网络:").grid(row=2, column=0, sticky="w", pady=(6, 0))
         net_row = ttk.Frame(auth)
-        net_row.grid(row=1, column=1, columnspan=2, sticky="we", padx=8, pady=(6, 0))
+        net_row.grid(row=2, column=1, columnspan=2, sticky="we", padx=8, pady=(6, 0))
         self.proxy_mode = StringVar(value="跟随系统 / 环境变量")
         self.proxy_combo = ttk.Combobox(net_row, textvariable=self.proxy_mode, width=20,
                                         state="readonly", values=list(PROXY_LABELS))
@@ -365,16 +398,16 @@ class ReleasePublisherApp:
         self.proxy_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_proxy_state())
 
         btn_row = ttk.Frame(auth)
-        btn_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=8, pady=(8, 0))
+        btn_row.grid(row=3, column=1, columnspan=2, sticky="w", padx=8, pady=(8, 0))
         self.verify_btn = ttk.Button(btn_row, text="权限自检", command=self._check_permissions)
         self.verify_btn.pack(side="left")
         ttk.Label(btn_row, text="（检查登录、仓库访问与写入权限）",
                   foreground="#888").pack(side="left", padx=8)
 
         self.auth_hint = StringVar(
-            value="Token 仅在本次运行时保留在内存中，不写入配置文件。")
+            value="默认不保存；勾选记住后，仅当前 Windows 用户可解密保存的 Token。")
         ttk.Label(auth, textvariable=self.auth_hint, foreground="#666").grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         # --- ② repo & release ---
         info = ttk.LabelFrame(self.root, text="② 仓库与 Release", padding=10)
@@ -384,6 +417,9 @@ class ReleasePublisherApp:
         ttk.Label(info, text="仓库（owner/name）:").grid(row=0, column=0, sticky="w")
         self.repo_var = StringVar()
         ttk.Entry(info, textvariable=self.repo_var, width=44).grid(row=0, column=1, sticky="we", padx=8)
+        self.create_repo_btn = ttk.Button(info, text="创建仓库…", width=12,
+                                          command=self._open_create_repo)
+        self.create_repo_btn.grid(row=0, column=2, sticky="w")
 
         ttk.Label(info, text="Tag（如 v1.2.0）:").grid(row=1, column=0, sticky="w")
         self.tag_var = StringVar()
@@ -453,7 +489,14 @@ class ReleasePublisherApp:
 
     def _populate_from_config(self):
         self.token_var.set("")
-        self.repo_var.set(self.cfg.get("repo", ""))
+        try:
+            saved = token_store.load_token(config_file())
+            if saved:
+                self.token_var.set(saved)
+                self.remember_token.set(True)
+        except (token_store.TokenStoreError, OSError) as e:
+            self._saved_token_error = str(e)
+        self.repo_var.set(self.cfg.get("repo") or DEFAULT_REPO)
         self.tag_var.set(self.cfg.get("tag", ""))
         self.title_var.set(self.cfg.get("title", ""))
         self.body_text.insert("1.0", self.cfg.get("body", ""))
@@ -470,6 +513,35 @@ class ReleasePublisherApp:
         self._refresh_file_list()
 
     # ---- helpers ----
+    def _remember_token_changed(self):
+        if self.remember_token.get():
+            token = self.token_var.get().strip()
+            if not token:
+                self.remember_token.set(False)
+                messagebox.showwarning("请先填写 Token", "输入 Token 后再勾选“记住 Token”。")
+                return
+            try:
+                token_store.store_token(config_file(), token)
+            except (token_store.TokenStoreError, OSError) as e:
+                self.remember_token.set(False)
+                messagebox.showerror("保存 Token 失败", str(e))
+                return
+            self.auth_hint.set("Token 已由 Windows 用户级加密保存；取消勾选即可删除。")
+        else:
+            try:
+                token_store.forget_token(config_file())
+            except OSError as e:
+                self.remember_token.set(True)
+                messagebox.showerror("删除 Token 失败", str(e))
+                return
+            self.auth_hint.set("不会保存 Token；关闭软件后需重新输入。")
+
+    def _persist_token_if_selected(self):
+        if self.remember_token.get():
+            token = self.token_var.get().strip()
+            if token:
+                token_store.store_token(config_file(), token)
+
     def _toggle_token_visibility(self):
         self.token_entry.config(show="" if self.show_token.get() else "●")
 
@@ -485,6 +557,7 @@ class ReleasePublisherApp:
         state = "disabled" if busy else "normal"
         self.publish_btn.config(state=state)
         self.verify_btn.config(state=state)
+        self.create_repo_btn.config(state=state)
         self.cancel_btn.config(state="normal" if busy else "disabled")
 
     def _log(self, msg: str):
@@ -550,16 +623,16 @@ class ReleasePublisherApp:
         repo = self.repo_var.get().strip().strip("/")
         if not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+", repo):
             raise ValueError("仓库格式应为 owner/name，例如 puppy-bai/MediaTranscriberSuite")
-        tag = self.tag_var.get().strip()
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
-            raise ValueError("Tag 仅可包含英文字母、数字、点、横线和下划线，如 v1.2.0")
         proxy_mode, proxy_url = self._current_proxy()
         if proxy_mode == "custom" and not proxy_url:
             raise ValueError("选择了自定义代理，但代理地址为空（例如 http://127.0.0.1:7890）")
-        return token, repo, tag, proxy_mode, proxy_url
+        return token, repo, proxy_mode, proxy_url
 
     def _validate_publish(self):
-        token, repo, tag, proxy_mode, proxy_url = self._validate_common()
+        token, repo, proxy_mode, proxy_url = self._validate_common()
+        tag = self.tag_var.get().strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
+            raise ValueError("Tag 仅可包含英文字母、数字、点、横线和下划线，如 v1.2.0")
         if not self._files:
             raise ValueError("请至少添加一个要上传的文件")
         missing = [p for p in self._files if not os.path.isfile(p)]
@@ -574,8 +647,9 @@ class ReleasePublisherApp:
         if self._busy:
             return
         try:
-            token, repo, _, proxy_mode, proxy_url = self._validate_common()
-        except ValueError as e:
+            token, repo, proxy_mode, proxy_url = self._validate_common()
+            self._persist_token_if_selected()
+        except (ValueError, token_store.TokenStoreError, OSError) as e:
             messagebox.showwarning("输入有误", str(e))
             return
         owner, name = repo.split("/", 1)
@@ -621,13 +695,121 @@ class ReleasePublisherApp:
                 extra = "\n\n" + "\n".join(info["notes"])
             messagebox.showinfo("自检通过", f"账号 {info['login']} 可以发布到此仓库。{extra}")
 
+    # ---- create repository ----
+    def _open_create_repo(self):
+        if self._busy:
+            return
+        if not self.token_var.get().strip():
+            messagebox.showwarning("请先填写 Token", "创建仓库需要先填写 GitHub Token。")
+            return
+        if self._create_win is not None and self._create_win.winfo_exists():
+            self._create_win.deiconify()
+            self._create_win.lift()
+            return
+
+        win = Toplevel(self.root)
+        self._create_win = win
+        win.title("创建 GitHub 仓库")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.columnconfigure(1, weight=1)
+
+        name_var = StringVar()
+        desc_var = StringVar()
+        private_var = BooleanVar(value=False)
+        init_var = BooleanVar(value=True)
+
+        ttk.Label(win, text="仓库名:").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
+        name_entry = ttk.Entry(win, textvariable=name_var, width=40)
+        name_entry.grid(row=0, column=1, sticky="we", padx=12, pady=(12, 4))
+
+        ttk.Label(win, text="描述（可选）:").grid(row=1, column=0, sticky="w", padx=12, pady=4)
+        ttk.Entry(win, textvariable=desc_var, width=40).grid(
+            row=1, column=1, sticky="we", padx=12, pady=4)
+
+        ttk.Checkbutton(win, text="私有仓库", variable=private_var).grid(
+            row=2, column=1, sticky="w", padx=12)
+        ttk.Checkbutton(win, text="自动创建初始提交（README，生成默认分支）",
+                        variable=init_var).grid(row=3, column=1, sticky="w", padx=12, pady=(0, 4))
+
+        ttk.Label(
+            win, justify="left", foreground="#666",
+            text=("会以当前 Token 的账号身份创建一个同名新仓库。\n"
+                  "Classic Token 需要 repo scope；细粒度 Token 需要\n"
+                  "Administration: Read and write（且覆盖 All repositories）。"),
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=12, pady=8)
+
+        btns = ttk.Frame(win)
+        btns.grid(row=5, column=0, columnspan=2, sticky="e", padx=12, pady=(0, 12))
+
+        def submit():
+            name = name_var.get().strip()
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", name) or name in (".", ".."):
+                messagebox.showwarning("仓库名无效",
+                                       "仓库名只能包含字母、数字、点、横线和下划线，长度 1-100。",
+                                       parent=win)
+                return
+            existing = self.repo_var.get().strip().strip("/")
+            if existing and existing.rsplit("/", 1)[-1].lower() == name.lower():
+                if not messagebox.askyesno(
+                        "确认创建",
+                        f"Repository access 里的仓库名已经是「{name}」。\n"
+                        "如果它已存在，GitHub 会返回 422 错误。仍要继续吗？",
+                        parent=win):
+                    return
+            token = self.token_var.get().strip()
+            proxy_mode, proxy_url = self._current_proxy()
+            opener = build_opener(proxy_mode, proxy_url)
+            description = desc_var.get().strip()
+            private = private_var.get()
+            auto_init = init_var.get()
+            win.destroy()
+            self._run_async(
+                lambda: create_repository(token, opener, name=name, description=description,
+                                          private=private, auto_init=auto_init),
+                on_success=self._create_repo_done,
+                on_error=self._create_repo_failed,
+                status="正在创建仓库…")
+
+        ttk.Button(btns, text="创建", command=submit).pack(side="left")
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="left", padx=8)
+        name_entry.focus_set()
+        win.bind("<Return>", lambda e: submit())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.grab_set()
+
+    def _create_repo_done(self, repo_obj):
+        full_name = repo_obj.get("full_name") or ""
+        url = repo_obj.get("html_url") or f"https://github.com/{full_name}"
+        if full_name:
+            self.repo_var.set(full_name)
+        self.status_label.config(text="仓库已创建")
+        self._log(f"仓库已创建：{full_name}（{url}）")
+        messagebox.showinfo("创建成功",
+                            f"仓库 {full_name} 已创建。\n{url}\n\n仓库名已填入上方，"
+                            "接下来可以发布 Release。")
+
+    def _create_repo_failed(self, err):
+        msg = str(err)
+        self._log(f"创建仓库失败：{msg}")
+        hint = ""
+        if "HTTP 401" in msg:
+            hint = "\n\nToken 无效或已过期，请重新生成。"
+        elif "HTTP 403" in msg:
+            hint = ("\n\nToken 没有创建仓库的权限：Classic Token 需勾选 repo；"
+                    "细粒度 Token 需 Administration: Read and write。")
+        elif "HTTP 422" in msg:
+            hint = "\n\n仓库名可能已被占用，或名称不符合 GitHub 规则。"
+        messagebox.showerror("创建仓库失败", msg[:800] + hint)
+
     def _publish(self):
         if self._busy:
             return
         try:
             (token, repo, tag, title, body, files,
              proxy_mode, proxy_url) = self._validate_publish()
-        except ValueError as e:
+            self._persist_token_if_selected()
+        except (ValueError, token_store.TokenStoreError, OSError) as e:
             messagebox.showwarning("输入有误", str(e))
             return
 
@@ -738,6 +920,11 @@ class ReleasePublisherApp:
         cb(result)
 
     def _on_close(self):
+        try:
+            self._persist_token_if_selected()
+        except (token_store.TokenStoreError, OSError) as e:
+            messagebox.showerror("保存 Token 失败", str(e))
+            return
         try:
             save_config({
                 "repo": self.repo_var.get().strip(),
