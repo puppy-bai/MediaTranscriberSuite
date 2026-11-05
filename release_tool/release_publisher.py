@@ -22,6 +22,7 @@ Run
     python release_publisher.py
 """
 
+import base64
 import json
 import mimetypes
 import os
@@ -243,6 +244,131 @@ def create_repository(token: str, opener, *, name: str, description: str = "",
     return obj
 
 
+# --------------------------------------------------------------------------
+# Upload plain files / folders into the repository (no Release involved)
+# --------------------------------------------------------------------------
+
+MAX_BLOB_BYTES = 100 * 1024 * 1024  # GitHub refuses blobs larger than 100 MB
+
+
+def _encode_branch(branch: str) -> str:
+    return urllib.parse.quote(branch, safe="/")
+
+
+def get_branch_head(owner: str, repo: str, branch: str, token: str, opener):
+    """Return (commit_sha, tree_sha) or (None, None) when the branch is absent."""
+    try:
+        ref, _, _ = request_json(
+            f"{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/{_encode_branch(branch)}",
+            token, opener)
+    except RuntimeError as e:
+        if str(e).startswith("HTTP 404:") or str(e).startswith("HTTP 409:"):
+            return None, None
+        raise
+    commit_sha = (ref.get("object") or {}).get("sha")
+    if not commit_sha:
+        return None, None
+    commit, _, _ = request_json(
+        f"{GITHUB_API}/repos/{owner}/{repo}/git/commits/{commit_sha}", token, opener)
+    return commit_sha, (commit.get("tree") or {}).get("sha")
+
+
+def create_blob(owner: str, repo: str, token: str, opener, data: bytes) -> str:
+    payload = {"content": base64.b64encode(data).decode("ascii"), "encoding": "base64"}
+    obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}/git/blobs", token, opener,
+                             method="POST", body=payload)
+    return obj["sha"]
+
+
+def create_tree(owner: str, repo: str, token: str, opener, entries: list[dict],
+                base_tree: str | None = None) -> str:
+    payload: dict = {"tree": entries}
+    if base_tree:
+        payload["base_tree"] = base_tree
+    obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}/git/trees", token, opener,
+                             method="POST", body=payload)
+    return obj["sha"]
+
+
+def create_commit(owner: str, repo: str, token: str, opener, message: str,
+                  tree: str, parents: list[str]) -> dict:
+    payload = {"message": message, "tree": tree,
+               "parents": [sha for sha in parents if sha]}
+    obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}/git/commits", token, opener,
+                             method="POST", body=payload)
+    return obj
+
+
+def update_branch_ref(owner: str, repo: str, token: str, opener, branch: str, sha: str) -> dict:
+    try:
+        obj, _, _ = request_json(
+            f"{GITHUB_API}/repos/{owner}/{repo}/git/refs/heads/{_encode_branch(branch)}",
+            token, opener, method="PATCH", body={"sha": sha, "force": False})
+        return obj
+    except RuntimeError as e:
+        if not str(e).startswith("HTTP 404:"):
+            raise
+        obj, _, _ = request_json(f"{GITHUB_API}/repos/{owner}/{repo}/git/refs", token, opener,
+                                 method="POST",
+                                 body={"ref": f"refs/heads/{branch}", "sha": sha})
+        return obj
+
+
+def upload_files_to_repo(owner: str, repo: str, token: str, opener,
+                         files: list[tuple[str, str]], *, branch: str = "main",
+                         target_dir: str = "", message: str = "",
+                         progress_cb=None, cancel: threading.Event | None = None,
+                         log=None) -> dict:
+    """Commit local files into a branch through the Git data API.
+
+    ``files`` holds (local path, path relative to the target directory) pairs.
+    Returns a summary dict with the new commit SHA and URL.
+    """
+    prefix = target_dir.strip().strip("/")
+    total = len(files)
+    for index, (local_path, rel) in enumerate(files, start=1):
+        if cancel is not None and cancel.is_set():
+            raise UploadCancelled()
+        size = os.path.getsize(local_path)
+        if size > MAX_BLOB_BYTES:
+            raise RuntimeError(f"{rel} 为 {human_size(size)}，超过 GitHub 单个文件 100 MB 的限制。"
+                               "请改用 Release 附件或 Git LFS。")
+        if log:
+            log(f"[{index}/{total}] 读取 {rel}（{human_size(size)}）")
+        with open(local_path, "rb") as fh:
+            data = fh.read()
+        blob_sha = create_blob(owner, repo, token, opener, data)
+        files[index - 1] = (local_path, rel, blob_sha, size)
+        if progress_cb:
+            progress_cb(index / max(total + 2, 1), rel)
+
+    commit_sha, tree_sha = get_branch_head(owner, repo, branch, token, opener)
+    if log:
+        log(f"目标分支 {branch}：" + (f"基于提交 {commit_sha[:10]}" if commit_sha else "尚不存在，将新建"))
+
+    entries = []
+    for _, rel, blob_sha, _size in files:  # type: ignore[misc]
+        path = f"{prefix}/{rel}" if prefix else rel
+        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
+
+    new_tree = create_tree(owner, repo, token, opener, entries, base_tree=tree_sha)
+    if progress_cb:
+        progress_cb((total + 1) / (total + 2), "tree")
+
+    commit = create_commit(owner, repo, token, opener,
+                           message or f"Upload {total} file(s) to {prefix or 'repository root'}",
+                           new_tree, [commit_sha] if commit_sha else [])
+    update_branch_ref(owner, repo, token, opener, branch, commit["sha"])
+    if progress_cb:
+        progress_cb(1.0, "ref")
+    return {
+        "commit": commit["sha"],
+        "url": commit.get("html_url") or f"https://github.com/{owner}/{repo}/commit/{commit['sha']}",
+        "count": total,
+        "branch": branch,
+    }
+
+
 MIME_OVERRIDES = {
     ".zip": "application/zip",
     ".exe": "application/vnd.microsoft.portable-executable",
@@ -343,14 +469,16 @@ class ReleasePublisherApp:
     def __init__(self, root: Tk):
         self.root = root
         root.title(APP_NAME)
-        root.geometry("880x840")
-        root.minsize(720, 620)
+        root.geometry("940x1020")
+        root.minsize(780, 700)
 
         self.cfg = load_config()
         self._busy = False
         self._events = queue.Queue()
+        self._cancel_evt = threading.Event()
         self._cancel = threading.Event()
         self._files: list[str] = []
+        self._repo_files: list[tuple[str, str]] = []
         self._release_url = ""
         self._saved_token_error = None
         self._create_win = None
@@ -461,8 +589,56 @@ class ReleasePublisherApp:
         self.file_hint = StringVar(value="尚未选择文件")
         ttk.Label(file_btns, textvariable=self.file_hint, foreground="#888").pack(side="left", padx=12)
 
-        # --- ④ actions ---
-        actions = ttk.LabelFrame(self.root, text="④ 发布", padding=10)
+        # --- ④ push files into the repository (no Release) ---
+        push = ttk.LabelFrame(self.root, text="④ 上传文件/文件夹到仓库（不创建 Release）",
+                              padding=10)
+        push.pack(fill="both", expand=True, **pad)
+        push.columnconfigure(0, weight=1)
+
+        self.repo_file_list = Listbox(push, height=4, selectmode="extended", activestyle="dotbox")
+        self.repo_file_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        push_scroll = ttk.Scrollbar(push, orient="vertical", command=self.repo_file_list.yview)
+        push_scroll.grid(row=0, column=1, sticky="ns")
+        self.repo_file_list.configure(yscrollcommand=push_scroll.set)
+
+        push_btns = ttk.Frame(push)
+        push_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(push_btns, text="添加文件…", command=self._add_repo_files).pack(side="left")
+        ttk.Button(push_btns, text="添加文件夹…", command=self._add_repo_folder).pack(side="left", padx=8)
+        ttk.Button(push_btns, text="移除所选",
+                   command=self._remove_repo_selected).pack(side="left")
+        ttk.Button(push_btns, text="清空", command=self._clear_repo_files).pack(side="left", padx=8)
+        self.repo_file_hint = StringVar(value="尚未选择文件")
+        ttk.Label(push_btns, textvariable=self.repo_file_hint,
+                  foreground="#888").pack(side="left", padx=12)
+
+        push_opts = ttk.Frame(push)
+        push_opts.grid(row=2, column=0, columnspan=2, sticky="we", pady=(8, 0))
+        push_opts.columnconfigure(1, weight=1)
+        ttk.Label(push_opts, text="仓库内目录（留空=根目录）:").grid(row=0, column=0, sticky="w")
+        self.repo_dir_var = StringVar()
+        ttk.Entry(push_opts, textvariable=self.repo_dir_var, width=28).grid(
+            row=0, column=1, sticky="we", padx=8)
+        ttk.Label(push_opts, text="分支:").grid(row=0, column=2, sticky="w")
+        self.branch_var = StringVar(value="main")
+        ttk.Entry(push_opts, textvariable=self.branch_var, width=16).grid(
+            row=0, column=3, sticky="w", padx=8)
+
+        ttk.Label(push_opts, text="提交说明:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.commit_msg_var = StringVar()
+        ttk.Entry(push_opts, textvariable=self.commit_msg_var, width=48).grid(
+            row=1, column=1, columnspan=3, sticky="we", padx=8, pady=(6, 0))
+
+        push_action = ttk.Frame(push)
+        push_action.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.push_btn = ttk.Button(push_action, text="提交到仓库",
+                                   command=self._push_files_to_repo)
+        self.push_btn.pack(side="left")
+        ttk.Label(push_action, text="（通过 Git API 直接提交文件，不生成 Release）",
+                  foreground="#888").pack(side="left", padx=8)
+
+        # --- ⑤ actions ---
+        actions = ttk.LabelFrame(self.root, text="⑤ 发布 Release", padding=10)
         actions.pack(fill="x", **pad)
         btn_row2 = ttk.Frame(actions)
         btn_row2.pack(fill="x")
@@ -481,7 +657,7 @@ class ReleasePublisherApp:
         self.progress_hint = StringVar(value="")
         ttk.Label(actions, textvariable=self.progress_hint, foreground="#666").pack(anchor="w")
 
-        # --- ⑤ log ---
+        # --- ⑥ log ---
         log_frame = ttk.LabelFrame(self.root, text="日志", padding=10)
         log_frame.pack(fill="both", expand=True, **pad)
         self.log = scrolledtext.ScrolledText(log_frame, height=7, state="disabled", wrap="word")
@@ -556,12 +732,22 @@ class ReleasePublisherApp:
         self._busy = busy
         state = "disabled" if busy else "normal"
         self.publish_btn.config(state=state)
+        self.push_btn.config(state=state)
         self.verify_btn.config(state=state)
         self.create_repo_btn.config(state=state)
         self.cancel_btn.config(state="normal" if busy else "disabled")
 
     def _log(self, msg: str):
         self._events.put(("log", msg))
+
+    def _reset_progress(self):
+        self._events.put(("progress", 0))
+        self._events.put(("hint", ""))
+
+    def _set_progress(self, percent: float, hint: str):
+        self._events.put(("progress", min(max(int(percent), 0), 100)))
+        if hint:
+            self._events.put(("hint", hint))
 
     def _drain_events(self):
         while True:
@@ -614,6 +800,116 @@ class ReleasePublisherApp:
             self.file_list.insert("end", f"{os.path.basename(path)}  ({human_size(size)})")
         self.file_hint.set(
             f"{len(self._files)} 个文件，共 {human_size(total)}" if self._files else "尚未选择文件")
+
+    # ---- repository file upload (no Release) ----
+    def _add_repo_files(self):
+        paths = filedialog.askopenfilenames(
+            title="选择要提交到仓库的文件（可多选）",
+            filetypes=[("所有文件", "*.*")])
+        for path in paths:
+            self._append_repo_file(path, os.path.basename(path))
+        self._refresh_repo_file_list()
+
+    def _add_repo_folder(self):
+        folder = filedialog.askdirectory(title="选择要整体上传到仓库的文件夹")
+        if not folder:
+            return
+        root_dir = os.path.normpath(folder)
+        prefix_name = os.path.basename(root_dir) or "root"
+        added = 0
+        for base, _dirs, names in os.walk(root_dir):
+            for name in sorted(names):
+                local = os.path.join(base, name)
+                rel = os.path.relpath(local, root_dir)
+                self._append_repo_file(local, f"{prefix_name}/{rel}".replace("\\", "/"))
+                added += 1
+        if added == 0:
+            messagebox.showinfo("空文件夹", f"“{prefix_name}” 里没有可上传的文件。")
+            return
+        self._refresh_repo_file_list()
+
+    def _append_repo_file(self, local_path: str, rel: str):
+        entry = (local_path, rel)
+        if entry not in self._repo_files:
+            self._repo_files.append(entry)
+
+    def _remove_repo_selected(self):
+        for index in sorted(self.repo_file_list.curselection(), reverse=True):
+            del self._repo_files[index]
+        self._refresh_repo_file_list()
+
+    def _clear_repo_files(self):
+        self._repo_files.clear()
+        self._refresh_repo_file_list()
+
+    def _refresh_repo_file_list(self):
+        self.repo_file_list.delete(0, "end")
+        total = 0
+        for local_path, rel in self._repo_files:
+            try:
+                size = os.path.getsize(local_path)
+            except OSError:
+                size = 0
+            total += size
+            self.repo_file_list.insert("end", f"{rel}  ({human_size(size)})")
+        self.repo_file_hint.set(
+            f"{len(self._repo_files)} 个文件，共 {human_size(total)}" if self._repo_files
+            else "尚未选择文件")
+
+    def _push_files_to_repo(self):
+        try:
+            token, repo, proxy_mode, proxy_url = self._validate_common()
+        except ValueError as e:
+            messagebox.showwarning("输入有误", str(e))
+            return
+        if not self._repo_files:
+            messagebox.showwarning("没有文件", "请先在“④ 上传文件/文件夹”里添加文件或文件夹。")
+            return
+        branch = self.branch_var.get().strip()
+        if not branch or not re.fullmatch(r"[A-Za-z0-9._/-]{1,250}", branch):
+            messagebox.showwarning("分支无效", "分支名不能为空，且只能包含字母、数字、点、下划线、斜杠。")
+            return
+        owner, _name = repo
+        target_dir = self.repo_dir_var.get().strip()
+        message = self.commit_msg_var.get().strip() or None
+        opener = build_opener(proxy_mode, proxy_url)
+
+        files = list(self._repo_files)
+        self._set_busy(True)
+        self._cancel_evt.clear()
+        self._reset_progress()
+        self._set_progress(0, "正在上传文件…")
+        self._persist_token_if_selected()
+
+        def worker():
+            try:
+                result = upload_files_to_repo(
+                    owner, repo, token, opener, files,
+                    branch=branch, target_dir=target_dir, message=message,
+                    progress_cb=lambda frac, label: self._set_progress(frac * 90, label),
+                    cancel=self._cancel_evt, log=self._log)
+                return result
+            except Exception as e:  # noqa: BLE001
+                return e
+
+        def done(result):
+            self._set_busy(False)
+            if isinstance(result, dict):
+                self._set_progress(100, "完成")
+                self._log(f"提交成功：{result['count']} 个文件 → 分支 {result['branch']}")
+                self._log(f"提交 {result['url']}")
+                messagebox.showinfo("提交成功",
+                                    f"已将 {result['count']} 个文件提交到 {branch} 分支。\n\n"
+                                    f"{result['url']}")
+            elif isinstance(result, Exception):
+                self._set_progress(0, "提交失败")
+                messagebox.showerror("提交失败", str(result))
+            else:
+                self._set_progress(0, "已取消")
+                self._log("已取消上传。")
+
+        self._run_async(worker, done, done, status="正在上传文件到仓库…")
+
 
     # ---- validation ----
     def _validate_common(self):
@@ -893,6 +1189,7 @@ class ReleasePublisherApp:
 
     def _cancel_upload(self):
         self._cancel.set()
+        self._cancel_evt.set()
         self._log("正在取消…（当前分块传完后停止）")
 
     def _open_release(self):
