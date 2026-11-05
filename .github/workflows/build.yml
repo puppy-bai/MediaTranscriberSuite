@@ -5,12 +5,17 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v-prefixed tag to build'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: build-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -20,6 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -45,15 +52,17 @@ jobs:
       - name: Determine version
         id: version
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = 'dev' }
-          $ver = $tag.TrimStart('v')
-          if ([string]::IsNullOrWhiteSpace($ver)) { $ver = 'dev' }
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v[0-9][A-Za-z0-9._-]*$') { throw "Expected an existing v-prefixed release tag: $tag" }
+          git rev-parse --verify "refs/tags/$tag" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Tag does not exist: $tag" }
+          $ver = $tag.Substring(1)
           Write-Host "tag=$tag ver=$ver"
-          Write-Output "tag=$tag"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Output "ver=$ver"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Output "zip=MediaTranscriberSuite-$ver-win64.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "ver=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Build with PyInstaller
         shell: pwsh
@@ -67,12 +76,14 @@ jobs:
           Write-Host "exe present: $exe"
 
       - name: Create zip
-        working-directory: release/candidate
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.ver }}
         run: |
-          $zip = "MediaTranscriberSuite-${{ steps.version.outputs.ver }}-win64.zip"
-          Compress-Archive -Path "MediaTranscriberSuite" -DestinationPath $zip -CompressionLevel Optimal -Force
-          $item = Get-Item $zip
+          $zip = "MediaTranscriberSuite-$env:RELEASE_VERSION-win64.zip"
+          $destination = Join-Path (Resolve-Path release/candidate) $zip
+          Compress-Archive -Path "release/candidate/MediaTranscriberSuite", "start_media_suite.bat" -DestinationPath $destination -CompressionLevel Optimal -Force
+          $item = Get-Item $destination
           Write-Host "created $($item.Name) size=$([math]::Round($item.Length/1MB,1))MB"
 
       - name: Upload build artifact
@@ -82,83 +93,27 @@ jobs:
           path: release/candidate/MediaTranscriberSuite-${{ steps.version.outputs.ver }}-win64.zip
           if-no-files-found: error
 
-      - name: Get or create draft release
-        id: release
+      - name: Publish release with zip
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_ZIP: ${{ steps.version.outputs.ver }}
         run: |
-          $owner = ($env:GITHUB_REPOSITORY -split '/')[0]
-          $repo  = ($env:GITHUB_REPOSITORY -split '/')[1]
-          $tag   = "${{ steps.version.outputs.tag }}"
-          $headers = @{
-            "Authorization" = "Bearer $env:GH_TOKEN"
-            "Accept" = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $zip = "MediaTranscriberSuite-$env:RELEASE_ZIP-win64.zip"
+          $file = "release/candidate/$zip"
+          if (-not (Test-Path $file)) { throw "Missing release asset: $file" }
+          # gh release upload --clobber makes a rerun idempotent, and gh release
+          # create works whether the tag was pushed directly or via dispatch.
+          $release = gh release view $tag --json id 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            if (($release | Out-String) -notmatch 'release not found') { throw "Failed to check release: $release" }
+            gh release create $tag --verify-tag --draft --title "Media Transcriber Suite $tag" --notes "Windows build: unzip the archive, then run start_media_suite.bat (keep the _internal directory alongside the executable)."
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to create draft release' }
           }
-          $apiRoot = "https://api.github.com/repos/$owner/$repo"
-          Write-Host "tag=$tag repository=$owner/$repo"
-
-          # Reuse an existing release for this tag (e.g. its draft created already),
-          # otherwise create a fresh draft before uploading the asset.
-          $existing = $null
-          try {
-            $existing = Invoke-RestMethod -Uri "$apiRoot/releases/tags/$tag" -Headers $headers -Method Get -ErrorAction Stop
-          } catch { $existing = $null }
-
-          if ($existing) {
-            Write-Host "reusing release id=$($existing.id)"
-            Write-Output "release_id=$($existing.id)"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Output "created=false"                 | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          } else {
-            $req = @{
-              tag_name = $tag
-              name = "Media Transcriber Suite $tag"
-              body = "Automatically built by GitHub Actions. Unpack the whole MediaTranscriberSuite folder after downloading (the exe needs the adjacent _internal directory)."
-              draft = $true
-              prerelease = $false
-            } | ConvertTo-Json
-            $rel = Invoke-RestMethod -Uri "$apiRoot/releases" -Headers $headers -Method Post -Body $req -ContentType "application/json"
-            Write-Host "created draft id=$($rel.id)"
-            Write-Output "release_id=$($rel.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            Write-Output "created=true"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
-
-      - name: Upload zip to release
-        shell: pwsh
-        working-directory: release/candidate
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $owner = ($env:GITHUB_REPOSITORY -split '/')[0]
-          $repo  = ($env:GITHUB_REPOSITORY -split '/')[1]
-          $id    = "${{ steps.release.outputs.release_id }}"
-          $zip   = "MediaTranscriberSuite-${{ steps.version.outputs.ver }}-win64.zip"
-          $uploadUrl = "https://uploads.github.com/repos/$owner/$repo/releases/$id/assets?name=$([uri]::EscapeDataString($zip))"
-          Write-Host "uploading $zip to $uploadUrl"
-          curl.exe -sS --fail --max-time 3600 `
-            -H "Authorization: Bearer $env:GH_TOKEN" `
-            -H "Accept: application/vnd.github+json" `
-            -H "X-GitHub-Api-Version: 2022-11-28" `
-            -H "Content-Type: application/zip" `
-            --data-binary "@$($PWD.Path)\$zip" `
-            "$uploadUrl"
-          Write-Host "upload finished"
-
-      - name: Publish release (un-draft)
-        shell: pwsh
-        if: steps.release.outputs.created == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $owner = ($env:GITHUB_REPOSITORY -split '/')[0]
-          $repo  = ($env:GITHUB_REPOSITORY -split '/')[1]
-          $id    = "${{ steps.release.outputs.release_id }}"
-          $headers = @{
-            "Authorization" = "Bearer $env:GH_TOKEN"
-            "Accept" = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
-          }
-          $req = @{ draft = $false } | ConvertTo-Json
-          Invoke-RestMethod -Uri "https://api.github.com/repos/$owner/$repo/releases/$id" -Headers $headers -Method Patch -Body $req -ContentType "application/json" | Out-Null
-          Write-Host "release published"
+          gh release upload $tag $file --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed' }
+          gh release edit $tag --draft=false
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to publish release' }

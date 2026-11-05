@@ -10,7 +10,7 @@ Features
 --------
 * Pick a file (zip / exe / anything) via the native file dialog.
 * Set repository (owner/name), tag, release title and body.
-* Save the Personal Access Token locally so you don't retype it.
+* Enter a Personal Access Token for this session (never save it to disk).
 * Create the release (draft optional) and upload the asset with progress.
 
 Run
@@ -22,6 +22,10 @@ import json
 import os
 import sys
 import threading
+import queue
+import http.client
+import mimetypes
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,7 +54,10 @@ def config_file() -> Path:
 def load_config() -> dict:
     try:
         with open(config_file(), "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            cfg = json.load(fh)
+        if "token" in cfg:
+            save_config(cfg)  # Remove plaintext credentials left by older releases.
+        return {key: value for key, value in cfg.items() if key != "token"}
     except Exception:
         return {}
 
@@ -59,15 +66,12 @@ def save_config(cfg: dict) -> None:
     fp = config_file()
     fp.parent.mkdir(parents=True, exist_ok=True)
     tmp = fp.with_suffix(".tmp")
+    # Never persist authentication credentials. Old config files may contain one;
+    # replacing the file also removes that legacy plaintext token.
+    safe = {key: value for key, value in cfg.items() if key != "token"}
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, ensure_ascii=False, indent=2)
+        json.dump(safe, fh, ensure_ascii=False, indent=2)
     tmp.replace(fp)
-    # Set the token file hidden+system-ish on Windows (best effort).
-    if os.name == "nt":
-        try:
-            os.system(f'attrib +h "{fp}" >nul')
-        except Exception:
-            pass
 
 
 # --------------------------------------------------------------------------
@@ -103,7 +107,7 @@ def _request(url: str, token: str, *, method: str = "GET",
             err = e.read().decode("utf-8")
         except Exception:
             err = str(e)
-        raise RuntimeError(f"HTTP {e.code}: {err}") from e
+        raise RuntimeError(f"HTTP {e.code}: {err[:1000]}") from e
 
 
 def api_user(token: str):
@@ -116,7 +120,7 @@ def find_release_by_tag(owner: str, repo: str, tag: str, token: str) -> dict | N
         obj, _ = _request(f"{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}", token)
         return obj
     except RuntimeError as e:
-        if "HTTP 404" in str(e):
+        if str(e).startswith("HTTP 404:"):
             return None
         raise
 
@@ -136,64 +140,37 @@ def create_release(owner: str, repo: str, token: str, *, tag: str, name: str,
     return obj
 
 
-class _ProgressFile:
-    """File-like wrapper that reports upload progress as bytes are read."""
-
-    def __init__(self, path: str, callback):
-        self._f = open(path, "rb")
-        self._total = os.path.getsize(path)
-        self._sent = 0
-        self._cb = callback
-
-    def read(self, amt: int = -1):
-        data = self._f.read(amt)
-        self._sent += len(data)
-        if self._cb and self._total:
-            self._cb(min(1.0, self._sent / self._total))
-        return data
-
-    def __len__(self):
-        return self._total
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self._f.close()
-
-
 def upload_asset(owner: str, repo: str, release_id: int, token: str,
                  file_path: str, progress_cb=None) -> dict:
+    """Stream a release asset without loading the whole file into memory."""
     asset_name = os.path.basename(file_path)
     total = os.path.getsize(file_path)
-    url = (f"{GITHUB_UPLOADS}/repos/{owner}/{repo}/releases/{release_id}"
-           f"/assets?name={urllib.parse.quote(asset_name)}")
-
-    with _ProgressFile(file_path, progress_cb) as pf:
-        req = urllib.request.Request(url, data=pf, method="POST",
-                                     headers=_headers(token, "application/zip"))
-        req.add_header("Content-Length", str(total))
-        try:
-            with urllib.request.urlopen(req, timeout=1800) as resp:
-                raw = resp.read().decode("utf-8")
-                if progress_cb:
-                    progress_cb(1.0)
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as e:
-            err = ""
-            try:
-                err = e.read().decode("utf-8")
-            except Exception:
-                err = str(e)
-            raise RuntimeError(f"上传失败 HTTP {e.code}: {err}") from e
-
-
-def set_release_draft(owner: str, repo: str, release_id: int, token: str, draft: bool) -> None:
+    encoded = urllib.parse.quote(asset_name, safe="")
+    content_type = mimetypes.guess_type(asset_name)[0] or "application/octet-stream"
+    path = f"/repos/{owner}/{repo}/releases/{release_id}/assets?name={encoded}"
+    conn = http.client.HTTPSConnection("uploads.github.com", timeout=1800)
     try:
-        _request(f"{GITHUB_API}/repos/{owner}/{repo}/releases/{release_id}", token,
-                 method="PATCH", body={"draft": draft})
-    except RuntimeError:
-        pass
+        conn.putrequest("POST", path)
+        for key, value in _headers(token, content_type).items():
+            conn.putheader(key, value)
+        conn.putheader("Content-Length", str(total))
+        conn.endheaders()
+        sent = 0
+        with open(file_path, "rb") as fh:
+            while chunk := fh.read(1024 * 1024):
+                conn.send(chunk)
+                sent += len(chunk)
+                if progress_cb and total:
+                    progress_cb(min(0.99, sent / total))
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8")
+        if not 200 <= resp.status < 300:
+            raise RuntimeError(f"上传失败 HTTP {resp.status}: {raw[:1000]}")
+        if progress_cb:
+            progress_cb(1.0)
+        return json.loads(raw)
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------
@@ -209,9 +186,11 @@ class ReleasePublisherApp:
 
         self.cfg = load_config()
         self._busy = False
+        self._events = queue.Queue()
 
         self._build_ui()
         self._populate_from_config()
+        self.root.after(100, self._drain_events)
 
     # ---- UI ----
     def _build_ui(self):
@@ -234,7 +213,7 @@ class ReleasePublisherApp:
         self.verify_btn.grid(row=1, column=1, sticky="w", pady=(6, 0))
 
         self.auth_hint = StringVar(
-            value="Token 会保存在本机（仅限当前用户），用于创建 Release 与上传。")
+            value="Token 仅在本次运行时保留在内存中，不写入配置文件。")
         ttk.Label(auth, textvariable=self.auth_hint, foreground="#666").grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
@@ -263,7 +242,6 @@ class ReleasePublisherApp:
         self.file_var = StringVar()
         self.file_entry = ttk.Entry(info, textvariable=self.file_var, width=44)
         self.file_entry.grid(row=4, column=1, sticky="we", padx=8)
-        self.file_entry.bind("<Return>", lambda e: self._clear_file_but_help())
         ttk.Button(info, text="浏览…", command=self._browse_file).grid(row=4, column=2)
 
         # --- ③ options ---
@@ -293,7 +271,7 @@ class ReleasePublisherApp:
         self.log.pack(fill="both", expand=True)
 
     def _populate_from_config(self):
-        self.token_var.set(self.cfg.get("token", ""))
+        self.token_var.set("")
         self.repo_var.set(self.cfg.get("repo", ""))
         self.tag_var.set(self.cfg.get("tag", ""))
         self.title_var.set(self.cfg.get("title", ""))
@@ -301,9 +279,6 @@ class ReleasePublisherApp:
         self.file_var.set(self.cfg.get("last_file", ""))
 
     # ---- minor helpers ----
-    def _clear_file_but_help(self):
-        messagebox.showinfo("提示", "可使用“浏览…”按钮选择文件，或在输入框直接粘贴完整路径。")
-
     def _toggle_token_visibility(self):
         self.token_entry.config(show="" if self.show_token.get() else "●")
 
@@ -314,10 +289,25 @@ class ReleasePublisherApp:
         self.verify_btn.config(state=state)
 
     def _log(self, msg: str):
-        self.log.config(state="normal")
-        self.log.insert("end", msg + "\n")
-        self.log.see("end")
-        self.log.config(state="disabled")
+        self._events.put(("log", msg))
+
+    def _drain_events(self):
+        while True:
+            try:
+                kind, value = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "log":
+                self.log.config(state="normal")
+                self.log.insert("end", value + "\n")
+                self.log.see("end")
+                self.log.config(state="disabled")
+            elif kind == "progress":
+                self.progress.config(value=value)
+            elif kind == "finish":
+                ok, result, cb = value
+                self._finish_async(ok, result, cb)
+        self.root.after(100, self._drain_events)
 
     # ---- actions ----
     def _browse_file(self):
@@ -330,11 +320,11 @@ class ReleasePublisherApp:
         if not token:
             raise ValueError("请先填写 GitHub Token（可在 github.com/settings/tokens 创建）")
         repo = self.repo_var.get().strip().strip("/")
-        if "/" not in repo:
+        if not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+", repo):
             raise ValueError("仓库格式应为 owner/name，例如 puppy-bai/MediaTranscriberSuite")
         tag = self.tag_var.get().strip()
-        if not tag:
-            raise ValueError("请填写 Tag（如 v1.2.0）")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
+            raise ValueError("Tag 仅可包含英文字母、数字、点、横线和下划线，如 v1.2.0")
         path = self.file_var.get().strip()
         if not path:
             raise ValueError("请选择要上传的文件")
@@ -363,9 +353,10 @@ class ReleasePublisherApp:
             messagebox.showwarning("输入有误", str(e))
             return
         owner, repo_name = repo.split("/", 1)
+        draft = self.draft_var.get()
 
         save_config({
-            "token": token, "repo": repo, "tag": tag,
+            "repo": repo, "tag": tag,
             "title": title, "body": body, "last_file": path,
         })
 
@@ -378,9 +369,9 @@ class ReleasePublisherApp:
                 self._log(f"创建 Release：{tag} @ {repo}")
                 rel = create_release(owner, repo_name, token, tag=tag,
                                      name=title or tag, body=body,
-                                     draft=self.draft_var.get())
+                                     draft=draft)
                 release_id = rel["id"]
-                self._log(f"已创建 Release id={release_id}（draft={self.draft_var.get()}）")
+                self._log(f"已创建 Release id={release_id}（draft={draft}）")
 
             self._log(f"正在上传 {os.path.basename(path)}（{round(os.path.getsize(path)/1e6,1)} MB）…")
             asset = upload_asset(owner, repo_name, release_id, token, path,
@@ -406,7 +397,7 @@ class ReleasePublisherApp:
 
     def _on_progress(self, frac: float):
         pct = int(frac * 100)
-        self.root.after(0, lambda: self.progress.config(value=pct))
+        self._events.put(("progress", pct))
 
     def _run_async(self, fn, on_success, on_error, status=""):
         self._set_busy(True)
@@ -416,9 +407,9 @@ class ReleasePublisherApp:
         def target():
             try:
                 result = fn()
-                self.root.after(0, lambda: self._finish_async(True, result, on_success))
+                self._events.put(("finish", (True, result, on_success)))
             except Exception as e:  # noqa: BLE001
-                self.root.after(0, lambda: self._finish_async(False, str(e), on_error))
+                self._events.put(("finish", (False, str(e), on_error)))
 
         threading.Thread(target=target, daemon=True).start()
 
@@ -430,7 +421,6 @@ class ReleasePublisherApp:
     def _on_close(self):
         try:
             save_config({
-                "token": self.token_var.get().strip(),
                 "repo": self.repo_var.get().strip(),
                 "tag": self.tag_var.get().strip(),
                 "title": self.title_var.get(),
