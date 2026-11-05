@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+release/
+
+# App runtime data (settings, API keys, downloads, transcripts, media)
+source/desktop/data/
+MediaTranscriberSuite/data/
+
+# Packaged Windows build (distributed as a GitHub Release asset, not in git)
+MediaTranscriberSuite/
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+*.log

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Media Text Suite"
+  short_description: "下载、转写和总结音视频内容"
+  default_prompt: "Use $media-text-suite to process this media link: "
+policy:
+  allow_implicit_invocation: true

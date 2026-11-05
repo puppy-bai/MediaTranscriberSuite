@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Media Downloader</title>
+    <link rel="stylesheet" href="src/popup.css">
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>媒体下载器</h1>
+        <p id="statusText">播放页面视频后自动捕获资源</p>
+      </div>
+      <button id="refreshBtn" title="刷新">↻</button>
+    </header>
+    <main>
+      <section class="actions">
+        <button id="clearBtn" class="secondary">清空当前页</button>
+      </section>
+      <section>
+        <h2>当前页资源</h2>
+        <div id="list" class="list"></div>
+      </section>
+    </main>
+    <script src="src/popup.js"></script>
+  </body>
+</html>
