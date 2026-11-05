@@ -1,5 +1,7 @@
 # Media Transcriber Suite
 
+> **English** | [简体中文](./README.zh-CN.md)
+
 Windows desktop app for downloading media, transcribing audio/video, and summarizing transcripts with MiniMax. The `source/extension` folder contains the independent browser download extension.
 
 ## Run the packaged app
@@ -19,6 +21,15 @@ powershell -ExecutionPolicy Bypass -File scripts/build_exe.ps1
 ```
 
 The build script writes the onedir package to `../release/candidate/MediaTranscriberSuite`. The packaged folder is not tracked in git; shipping builds are attached to GitHub Releases instead.
+
+### Build automatically with GitHub Actions
+
+The repository includes [`.github/workflows/build.yml`](.github/workflows/build.yml). When you push a tag starting with `v` (e.g. `v1.1.0`), GitHub Actions builds on Windows and uploads the zip as a Release asset.
+
+```powershell
+git tag v1.1.0
+git push origin v1.1.0
+```
 
 ## Agent CLI
 
