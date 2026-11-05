@@ -485,6 +485,7 @@ class ReleasePublisherApp:
 
         self._build_ui()
         self._populate_from_config()
+        root.report_callback_exception = self._report_callback_exception
         self.root.after(100, self._drain_events)
         if self._saved_token_error:
             self.root.after(200, lambda: messagebox.showwarning(
@@ -689,6 +690,17 @@ class ReleasePublisherApp:
         self._refresh_file_list()
 
     # ---- helpers ----
+    def _report_callback_exception(self, exc, val, tb):
+        import traceback
+        detail = "".join(traceback.format_exception(exc, val, tb))
+        self._log(f"内部错误：{val}")
+        try:
+            messagebox.showerror(
+                "发生内部错误",
+                "操作没有完成，请把下面的信息发给开发者：\n\n" + detail[-1200:])
+        except Exception:  # noqa: BLE001
+            pass
+
     def _remember_token_changed(self):
         if self.remember_token.get():
             token = self.token_var.get().strip()
@@ -869,7 +881,7 @@ class ReleasePublisherApp:
         if not branch or not re.fullmatch(r"[A-Za-z0-9._/-]{1,250}", branch):
             messagebox.showwarning("分支无效", "分支名不能为空，且只能包含字母、数字、点、下划线、斜杠。")
             return
-        owner, _name = repo
+        owner, _name = repo.split("/", 1)
         target_dir = self.repo_dir_var.get().strip()
         message = self.commit_msg_var.get().strip() or None
         opener = build_opener(proxy_mode, proxy_url)
